@@ -340,9 +340,9 @@ class LeasedPostAttention:
         if self.failure_reporter is not None:
             self.failure_reporter("leased_post_attention", str(error), owners)
         else:
-            from .lingbot_sp8_fatal import report_failure
+            from .failure import retain_failure_owners
 
-            report_failure("leased_post_attention", str(error), owners)
+            retain_failure_owners(owners)
 
     @contextmanager
     def acquire(self, hidden, gate, camera_scale, camera_shift):

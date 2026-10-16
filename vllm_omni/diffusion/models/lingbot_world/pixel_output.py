@@ -86,7 +86,7 @@ def exact_planar_pixels(video):
     # Decoder.decode_chunk ordinarily clamps [-1,1] before _uint8_frames.
     # Move these elementwise operations before spatial/temporal concatenation
     # while retaining every decoder-dtype and FP32 rounding boundary.
-    from .lingbot_pixels import planar_uint8_tensor
+    from .pixels import planar_uint8_tensor
 
     return planar_uint8_tensor(video.clamp(-1.0, 1.0))
 
@@ -140,15 +140,15 @@ def gather_final_pixels(local_video, *, policy, split_dim, expected_extent):
         owners.append(result)
         _retain_until_complete(owners, result.device)
         return result
-    except BaseException as error:
-        from .lingbot_sp8_fatal import report_failure
+    except BaseException:
+        from .failure import retain_failure_owners
 
-        report_failure("final_pixel_output", str(error), owners)
+        retain_failure_owners(owners)
         raise
 
 
 def planar_pixels_to_host(pixels):
-    from .lingbot_pixels import _interleave_planar
+    from .pixels import _interleave_planar
 
     if pixels.dtype != torch.uint8 or pixels.ndim != 4 or pixels.shape[0] != 3:
         raise ValueError("Pixel assembly returned an invalid planar arena")

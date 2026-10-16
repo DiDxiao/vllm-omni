@@ -19,7 +19,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
 @pytest.fixture(scope="module")
 def leased():
-    path = Path(__file__).resolve().parents[3] / "vllm_omni/diffusion/layers/lingbot_leased_post_attention.py"
+    path = Path(__file__).resolve().parents[4] / "vllm_omni/diffusion/models/lingbot_world/leased_post_attention.py"
     spec = importlib.util.spec_from_file_location("sp8_leased_post_attention_test", path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
@@ -332,7 +332,7 @@ def reverse_exchange_oracle(destination_rank):
             target.copy_(torch.stack([value[destination_rank] for value in sends]))
 
     dist = Dist()
-    source = Path(__file__).resolve().parents[3] / "vllm_omni/diffusion/distributed/comm.py"
+    source = Path(__file__).resolve().parents[4] / "vllm_omni/diffusion/distributed/comm.py"
     functions: list[ast.stmt] = [
         node for node in ast.parse(source.read_text()).body if isinstance(node, ast.FunctionDef)
     ]
@@ -398,7 +398,7 @@ def test_owned_reverse_exchange_retains_packing_receive_and_target_after_collect
     exchange, sources, expected, dist = reverse_exchange_oracle(0)
     target = torch.empty_like(expected)
     submitted: list[torch.Tensor] = []
-    failures = []
+    failures: list[tuple[object, ...]] = []
 
     def failed_collective(output, input_, group):
         dist.calls += 1
@@ -406,15 +406,15 @@ def test_owned_reverse_exchange_retains_packing_receive_and_target_after_collect
         raise RuntimeError("injected failure after collective submission")
 
     dist.all_to_all_single = failed_collective
-    fatal_module = ModuleType("vllm_omni.diffusion.layers.lingbot_sp8_fatal")
-    monkeypatch.setattr(fatal_module, "report_failure", lambda *args: failures.append(args), raising=False)
+    fatal_module = ModuleType("vllm_omni.diffusion.models.lingbot_world.failure")
+    monkeypatch.setattr(fatal_module, "retain_failure_owners", failures.append, raising=False)
     monkeypatch.setitem(
         sys.modules,
-        "vllm_omni.diffusion.layers.lingbot_sp8_fatal",
+        "vllm_omni.diffusion.models.lingbot_world.failure",
         fatal_module,
     )
     with pytest.raises(RuntimeError, match="after collective submission"):
         exchange(sources[0], 1, 2, group="ulysses", _output_destination=target)
     assert dist.calls == 1 and len(failures) == 1
-    owners = failures[0][2]
+    owners = failures[0]
     assert all(any(owner is tensor for owner in owners) for tensor in (sources[0], *submitted, target))

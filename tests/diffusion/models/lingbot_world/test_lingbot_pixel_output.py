@@ -2,8 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """CPU contracts for final pixel assembly; device/full-model gates are separate."""
 
+import gc
 import importlib.util
 import sys
+import weakref
 from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
@@ -16,12 +18,12 @@ pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
 @pytest.fixture(scope="module")
 def pixel_modules():
-    source = Path(__file__).resolve().parents[3] / "vllm_omni"
+    source = Path(__file__).resolve().parents[4] / "vllm_omni"
     package_name = "sp8_pixels_cpu"
     original_modules = set(sys.modules)
     with pytest.MonkeyPatch.context() as patch:
         package = ModuleType(package_name)
-        package.__path__ = [str(source / "diffusion/layers")]
+        package.__path__ = [str(source / "diffusion/models/lingbot_world")]
         patch.setitem(sys.modules, package_name, package)
 
         def load(name, path):
@@ -32,7 +34,7 @@ def pixel_modules():
             spec.loader.exec_module(module)
             return module
 
-        pixels = load(f"{package_name}.lingbot_pixel_output", source / "diffusion/layers/lingbot_pixel_output.py")
+        pixels = load(f"{package_name}.pixel_output", source / "diffusion/models/lingbot_world/pixel_output.py")
         decoder = load("sp8_streaming_cpu", source / "experimental/ar_diffusion/streaming_decode.py")
         try:
             yield pixels, decoder.WanStreamingDecoder
@@ -117,6 +119,38 @@ def test_nonprimary_batch_sends_only_to_group_primary(pixel_modules, monkeypatch
     out = pixels.gather_final_pixels(shard, policy=policy, split_dim="width", expected_extent=16)
     assert out.numel() == 0 and len(operations) == len(waits) == 1
     assert torch.equal(shard, old)
+
+
+def test_collective_failure_retains_owners_and_propagates_original_error(pixel_modules, monkeypatch):
+    pixels, _ = pixel_modules
+    failure = importlib.import_module(f"{pixels.__package__}.failure")
+    quarantine: list[tuple[object, ...]] = []
+    monkeypatch.setattr(failure, "_QUARANTINE", quarantine)
+    source = torch.zeros(1, 3, 2, 2, 2)
+    references = [weakref.ref(source)]
+    error = RuntimeError("injected pixel collective failure")
+    calls = []
+
+    def failed_collective(received, send, group):
+        calls.append(group)
+        references.extend(weakref.ref(value) for value in (send, *received))
+        raise error
+
+    monkeypatch.setattr(torch.distributed, "all_gather", failed_collective)
+    policy = pixels.PixelOutputPolicy("root_uint8_allgather", object(), 0, 8)
+    with pytest.raises(RuntimeError) as observed:
+        pixels.gather_final_pixels(source, policy=policy, split_dim="width", expected_extent=16)
+    assert observed.value is error and calls == [policy.group]
+    assert len(quarantine) == 1
+    # Prove the owner quarantine, rather than the exception traceback, keeps
+    # source/send/receive storage alive after the failed call has unwound.
+    error.__traceback__ = None
+    del observed, source
+    gc.collect()
+    assert all(reference() is not None for reference in references)
+    quarantine.clear()
+    gc.collect()
+    assert all(reference() is None for reference in references)
 
 
 def test_exhaustive_bf16_pixel_rounding(pixel_modules):

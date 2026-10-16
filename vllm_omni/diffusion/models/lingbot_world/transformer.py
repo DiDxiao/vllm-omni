@@ -41,7 +41,7 @@ from vllm_omni.experimental.ar_diffusion.kv_cache.paged_attention import (
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
-    from vllm_omni.diffusion.layers.lingbot_leased_post_attention import Lease
+    from vllm_omni.diffusion.models.lingbot_world.leased_post_attention import Lease
 
 
 @dataclass
@@ -663,7 +663,7 @@ class LingBotAttentionBlock(nn.Module):
         normalized = self.norm1(hidden_states.float()).unflatten(1, (num_frames, tokens_per_frame))
         normalized = (normalized * (1 + scale_msa) + shift_msa).flatten(1, 2).to(hidden_states.dtype)
         if hasattr(self, "_lingbot_leased_post_attention"):
-            from vllm_omni.diffusion.layers.lingbot_leased_post_attention import acquire
+            from vllm_omni.diffusion.models.lingbot_world.leased_post_attention import acquire
 
             camera_scale, camera_shift = (
                 self.camera_modulation(camera_hidden_states) if camera_modulation is None else camera_modulation

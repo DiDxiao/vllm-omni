@@ -121,21 +121,11 @@ execution failure abort the candidate; there is no mid-execution fallback.
 After a submitted operation fails, failure handling retains active tensor owners
 until process teardown, and the caller propagates the original exception.
 
-Deployments can provide an external launcher to consume optional failure
-receipts. It configures `ROOT_LINGBOT_SP8_FATAL_DIR` as an existing absolute
-directory and `ROOT_LINGBOT_SP8_FATAL_NONCE` as a launch-specific 32-character
-lowercase hexadecimal nonce. These legacy names do not require OS root
-privileges. With neither variable set, no receipt is emitted; owners are still
-retained and the caller still propagates the exception. A receipt-write failure
-attempts a structured stderr report instead.
-
-This PR supplies the reporting side only: it does not include a receipt consumer,
-supervisor, or automatic worker restart. The external launcher must verify the
-launch nonce and process identities before terminating all eight workers it
-started. It must start fresh workers before admitting another request after an
-irrecoverable execution failure; `restart_scope: all8` in a receipt is advisory
-metadata, not an implemented restart action. End-to-end failure supervision
-remains a deployment integration requirement.
+Failure handling is local to the LingBot model implementation and requires no
+environment variables or file-reporting channel. The serving deployment remains
+responsible for terminating its eight-worker launch and starting fresh workers
+before admitting another request after an irrecoverable execution failure.
+Automatic worker restart is not part of these experimental output paths.
 
 These experimental modes require eight-rank correctness, paired model timing
 and lifecycle validation before enabling them in a serving deployment. CPU
@@ -153,8 +143,9 @@ The CPU contracts can be run without weights or NPU initialization:
 ```bash
 TORCH_DEVICE_BACKEND_AUTOLOAD=0 OMP_NUM_THREADS=1 python -m pytest \
   --noconftest -c pyproject.toml -o addopts='' \
-  tests/diffusion/layers/test_lingbot_pixel_output.py \
-  tests/diffusion/layers/test_lingbot_leased_post_attention.py -q
+  tests/diffusion/models/lingbot_world/test_lingbot_pixel_output.py \
+  tests/diffusion/models/lingbot_world/test_lingbot_leased_post_attention.py \
+  tests/diffusion/models/lingbot_world/test_lingbot_world_imports.py -q
 ```
 
 This isolated command omits the repository's integration fixtures. In a full

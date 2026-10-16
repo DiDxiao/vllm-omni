@@ -106,7 +106,7 @@ _VAE_SHARD_SPLIT_DIM = "width"
 if TYPE_CHECKING:
     from tqdm.std import tqdm as TqdmProgressBar
 
-    from vllm_omni.diffusion.layers.lingbot_pixel_output import PixelOutputPolicy
+    from vllm_omni.diffusion.models.lingbot_world.pixel_output import PixelOutputPolicy
     from vllm_omni.diffusion.worker.input_batch import InputBatch
     from vllm_omni.diffusion.worker.utils import StepRequestState
     from vllm_omni.experimental.ar_diffusion.kv_cache.state import (
@@ -608,16 +608,12 @@ class LingBotWorldCausalDMDPipeline(
         parallel_config = getattr(od_config, "parallel_config", None)
         self.od_config = od_config
         model_config = getattr(od_config, "model_config", None) or {}
-        from vllm_omni.diffusion.layers.lingbot_pixel_output import validate_mode
+        from vllm_omni.diffusion.models.lingbot_world.pixel_output import validate_mode
 
         self._lingbot_pixel_output_mode = validate_mode(model_config.get("lingbot_npu_pixel_output_mode", "native"))
         self._lingbot_leased_post_attention = model_config.get("lingbot_npu_leased_post_attention", False)
         if type(self._lingbot_leased_post_attention) is not bool:
             raise ValueError("lingbot_npu_leased_post_attention must be a bool")
-        if self._lingbot_leased_post_attention or self._lingbot_pixel_output_mode != "native":
-            from vllm_omni.diffusion.layers.lingbot_sp8_fatal import ensure_protocol
-
-            ensure_protocol()
         reuse_last_step_kv = model_config.get("lingbot_reuse_last_step_kv", False)
         if not isinstance(reuse_last_step_kv, bool):
             raise ValueError("model_config.lingbot_reuse_last_step_kv must be a bool.")
@@ -1862,7 +1858,7 @@ class LingBotWorldCausalDMDPipeline(
         ):
             import torch.distributed as dist
 
-            from vllm_omni.diffusion.layers.lingbot_pixel_output import PixelOutputPolicy
+            from vllm_omni.diffusion.models.lingbot_world.pixel_output import PixelOutputPolicy
 
             group, degree = self._vae_shard_group()
             if degree == 8:
@@ -1876,7 +1872,7 @@ class LingBotWorldCausalDMDPipeline(
         if pixel_policy is not None and not pixel_policy.produce_output:
             return None
         if pixel_policy is not None and pixel_policy.planar_uint8:
-            from vllm_omni.diffusion.layers.lingbot_pixel_output import planar_pixels_to_host
+            from vllm_omni.diffusion.models.lingbot_world.pixel_output import planar_pixels_to_host
 
             return planar_pixels_to_host(video)
         return _uint8_frames(video)
@@ -1898,7 +1894,7 @@ class LingBotWorldCausalDMDPipeline(
         state = self._streaming_decode_state(decoder, session_id)
         try:
             if pixel_policy is not None:
-                from vllm_omni.diffusion.layers.lingbot_pixel_output import pixel_output_context
+                from vllm_omni.diffusion.models.lingbot_world.pixel_output import pixel_output_context
 
                 with pixel_output_context(pixel_policy):
                     return decoder.decode_chunk(
@@ -1908,15 +1904,15 @@ class LingBotWorldCausalDMDPipeline(
                         produce_output=pixel_policy.produce_output,
                     )
             return decoder.decode_chunk(vae_latents, state)
-        except Exception as error:
+        except Exception:
             # A half-advanced cache cannot be resumed: the session's next chunk
             # would continue from a temporal context that was never completed,
             # so drop it here rather than at close.
             self._release_streaming_decode_state(session_id)
             if pixel_policy is not None:
-                from vllm_omni.diffusion.layers.lingbot_sp8_fatal import report_failure
+                from vllm_omni.diffusion.models.lingbot_world.failure import retain_failure_owners
 
-                report_failure("streaming_pixel_output", str(error), (self, vae_latents, state, pixel_policy))
+                retain_failure_owners((self, vae_latents, state, pixel_policy))
             raise
 
     def _require_bound_ar_state(self) -> None:
@@ -2283,7 +2279,7 @@ class LingBotWorldCausalDMDPipeline(
         loader = AutoWeightsLoader(self)
         loaded = loader.load_weights(weights)
         if self._lingbot_leased_post_attention:
-            from vllm_omni.diffusion.layers.lingbot_leased_post_attention import install
+            from vllm_omni.diffusion.models.lingbot_world.leased_post_attention import install
 
             install(self.transformer, enabled=True)
         return cast(set[str], loaded)

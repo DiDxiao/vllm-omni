@@ -932,7 +932,10 @@ def install_wan_spatial_shard_decode(
             out = orig_forward(x, feat_cache=feat_cache, feat_idx=feat_idx, first_chunk=first_chunk)
         finally:
             _SPATIAL_SHARD_CONTEXT.reset(token)
-        from vllm_omni.diffusion.layers.lingbot_pixel_output import current_pixel_output_policy, gather_final_pixels
+        from vllm_omni.diffusion.models.lingbot_world.pixel_output import (
+            current_pixel_output_policy,
+            gather_final_pixels,
+        )
 
         pixel_policy = current_pixel_output_policy()
         if pixel_policy is not None:

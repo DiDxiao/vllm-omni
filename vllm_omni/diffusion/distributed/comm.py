@@ -144,10 +144,10 @@ def _owned_reverse_all_to_all(input, destination, group, world_size, use_sync):
             output = input_t
         destination.copy_(output.reshape(heads * world_size, tokens, bs, width).transpose(0, 2))
         return destination
-    except BaseException as error:
-        from vllm_omni.diffusion.layers.lingbot_sp8_fatal import report_failure
+    except BaseException:
+        from vllm_omni.diffusion.models.lingbot_world.failure import retain_failure_owners
 
-        report_failure("leased_reverse_a2a", str(error), (input, input_t, output, destination, group))
+        retain_failure_owners((input, input_t, output, destination, group))
         raise
 
 
