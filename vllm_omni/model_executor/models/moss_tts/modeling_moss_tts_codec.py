@@ -1042,7 +1042,7 @@ class MossTTSCodecDecoder(nn.Module):
         if session is None:
             return {}
 
-        if self._packed_decode_ready and all(
+        if session._packed_wrapper is not None and all(
             0 < codes.shape[1] <= self._stream_max_step_frames for _, _, codes, _ in items
         ):
             return self._decode_streaming_packed(session, items)
