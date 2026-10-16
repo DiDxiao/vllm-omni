@@ -1177,9 +1177,14 @@ class MossAudioTokenizerMultiheadAttention(StreamingModule):
         dim_per_head = self.embed_dim // self.num_heads
         projected = self.in_projs[0](query).view(1, N, 3, self.num_heads, dim_per_head)
         # Token-major (1, N, H, D) views keep every stride but the batch one fixed.
-        q, k = self.rope(
-            projected[:, :, 0], projected[:, :, 1], offset, time_before_heads=True, table=context.rope_table
-        )
+        if projected.is_cuda:
+            cos, sin = context.rope_table
+            rope_qk_(projected, cos.view(1, 1, N, -1), sin.view(1, 1, N, -1))
+            q, k = projected[:, :, 0], projected[:, :, 1]
+        else:
+            q, k = self.rope(
+                projected[:, :, 0], projected[:, :, 1], offset, time_before_heads=True, table=context.rope_table
+            )
         v = projected[:, :, 2]
         x = slot_ring_flash_attention_packed(
             q.transpose(1, 2),
@@ -1743,6 +1748,11 @@ class MossAudioTokenizerTransformer(StreamingModule):
         return len(self.layers) > 0 and all(layer.fused_norm_ready for layer in self.layers)
 
     def _forward_fused_layers(self, x, state, offsets, metadata, execution_context, frames: int):
+        x = self._fused_layers(x, execution_context)
+        self._advance_offsets(state, offsets, metadata, execution_context, frames)
+        return x
+
+    def _fused_layers(self, x, execution_context):
         """The layer loop with every residual add fused into the next LayerNorm.
 
         Per layer: attention on ``norm1(x)``, then one kernel for
@@ -1766,7 +1776,6 @@ class MossAudioTokenizerTransformer(StreamingModule):
         finally:
             for layer in layers:
                 layer.self_attn._cached_attn_bias = None
-        self._advance_offsets(state, offsets, metadata, execution_context, frames)
         return x
 
     def _forward_packed(self, x: torch.Tensor, context: StreamingExecutionContext) -> torch.Tensor:
@@ -1805,8 +1814,11 @@ class MossAudioTokenizerTransformer(StreamingModule):
             packed_stage=(lengths, tok_starts, entry_seg, entry_blk),
             packed_offsets=offsets if block is not None else None,
         )
-        for layer in self.layers:
-            x = layer(x, execution_context=context)
+        if self._fused_norm_ready(x, context):
+            x = self._fused_layers(x, context)
+        else:
+            for layer in self.layers:
+                x = layer(x, execution_context=context)
         next_offsets = torch.where(context.valid_rows, offsets + lengths, offsets)
         if block is not None:
             block.index_copy_(1, slots, next_offsets.unsqueeze(0).expand(block.shape[0], -1))

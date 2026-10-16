@@ -255,8 +255,8 @@ class _MossCodecStreamSession:
             else []
         )
         if packed_frame_sizes:
-            # Ordinary graphs remain for per-request reference/first-frame priming.
-            batch_sizes = [min(batch_sizes)]
+            # Packed graphs decode every streaming step; no batched graphs.
+            batch_sizes = []
         # A packed call's segments past its streams own distinct scratch slots.
         packed_segments = self._state_capacity + 1
         if packed_frame_sizes:
@@ -320,25 +320,21 @@ class _MossCodecStreamSession:
             self.reset_slots(list(range(self._state_capacity + scratch_capacity)))
         self._packed_wrapper: CUDAGraphPackedDecoderWrapper | None = None
         if packed_frame_sizes:
-            from vllm.compilation.backends import set_model_tag
-
             from vllm_omni.model_executor.models.moss_tts.packed_codec import (
                 CUDAGraphPackedDecoderWrapper,
                 enable_packed_decode,
             )
 
             stages = enable_packed_decode(codec, self._chunk_frames)
-            # Its own compile cache: the packed graph is a different program.
-            with set_model_tag("moss_codec_packed"):
-                self._packed_wrapper = CUDAGraphPackedDecoderWrapper(
-                    codec,
-                    frame_sizes=packed_frame_sizes,
-                    max_segments=packed_segments,
-                    scratch_base=self._state_capacity,
-                    num_quantizers=self._n_vq,
-                    vllm_config=vllm_config,
-                )
-                self._packed_wrapper.warmup(self._device)
+            self._packed_wrapper = CUDAGraphPackedDecoderWrapper(
+                codec,
+                frame_sizes=packed_frame_sizes,
+                max_segments=packed_segments,
+                scratch_base=self._state_capacity,
+                num_quantizers=self._n_vq,
+                vllm_config=vllm_config,
+            )
+            self._packed_wrapper.warmup(self._device)
             self.reset_slots(list(range(self._state_capacity + scratch_capacity)))
             logger.info("MOSS-TTS packed codec decode: %d decoder transformers", stages)
 
@@ -1042,9 +1038,7 @@ class MossTTSCodecDecoder(nn.Module):
         if session is None:
             return {}
 
-        if session._packed_wrapper is not None and all(
-            0 < codes.shape[1] <= self._stream_max_step_frames for _, _, codes, _ in items
-        ):
+        if session._packed_wrapper is not None:
             return self._decode_streaming_packed(session, items)
 
         outputs: dict[int, torch.Tensor] = {}
@@ -1129,13 +1123,17 @@ class MossTTSCodecDecoder(nn.Module):
     def _decode_streaming_packed(
         self, session: _MossCodecStreamSession, items: list[tuple[int, str, torch.Tensor, bool]]
     ) -> dict[int, torch.Tensor]:
-        """``_decode_streaming_batch`` with one packed call for any mix of chunk lengths.
+        """``_decode_streaming_batch`` through packed calls, for any mix of chunk lengths.
 
         Items are ``(output_index, request_id, codes [n_vq, frames], finished)``
-        with distinct requests, each chunk at most one steady chunk long.
+        with distinct requests. A chunk longer than one steady chunk is split
+        into steady pieces; round ``r`` packs the ``r``-th piece of every
+        chunk, so each stream's pieces decode in order.
         """
-        plan: list[tuple[int, torch.Tensor, bool]] = []
+        step_frames = max(1, int(self._stream_max_step_frames))
+        pieces: dict[int, list[torch.Tensor]] = {}
         index_of: dict[int, int] = {}
+        finished_slots: set[int] = set()
         for output_index, request_id, codes_nq_t, finished in items:
             slot = self._stream_req_slots.get(request_id)
             if slot is None:
@@ -1146,14 +1144,33 @@ class MossTTSCodecDecoder(nn.Module):
                         f"(max_num_seqs={self._stream_state_capacity})."
                     )
                 self._stream_req_slots[request_id] = slot
-            plan.append((slot, codes_nq_t, finished))
+            frames = int(codes_nq_t.shape[1])
+            pieces[slot] = [codes_nq_t[:, start : start + step_frames] for start in range(0, frames, step_frames)]
             index_of[slot] = output_index
-        decoded = session.step_packed(plan)
-        outputs = {index_of[slot]: wav for slot, wav in decoded.items()}
-        for _, request_id, _, finished in items:
             if finished:
+                finished_slots.add(slot)
+        decoded: dict[int, list[torch.Tensor]] = {slot: [] for slot in pieces}
+        for r in range(max(map(len, pieces.values()), default=0)):
+            plan = [
+                (slot, chunks[r], slot in finished_slots and r == len(chunks) - 1)
+                for slot, chunks in pieces.items()
+                if r < len(chunks)
+            ]
+            for slot, wav in session.step_packed(plan).items():
+                decoded[slot].append(wav)
+        outputs = {
+            index_of[slot]: torch.cat(wavs, dim=-1) if len(wavs) > 1 else wavs[0]
+            for slot, wavs in decoded.items()
+            if wavs
+        }
+        for _, request_id, codes_nq_t, finished in items:
+            if finished:
+                # A terminal piece reset its slot's state; an empty chunk left it to the release.
                 self._finish_stream_request(
-                    request_id, session, self._stream_req_slots.get(request_id), state_already_reset=True
+                    request_id,
+                    session,
+                    self._stream_req_slots.get(request_id),
+                    state_already_reset=int(codes_nq_t.shape[1]) > 0,
                 )
         return outputs
 

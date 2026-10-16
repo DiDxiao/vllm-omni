@@ -22,7 +22,7 @@ stereo codec.
 
 from __future__ import annotations
 
-import copy
+import functools
 import time
 from dataclasses import dataclass
 
@@ -30,9 +30,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.cuda import CUDAGraph
-from vllm.compilation.decorators import support_torch_compile
-from vllm.config import CUDAGraphMode, VllmConfig
-from vllm.config.vllm import set_current_vllm_config
+from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
@@ -165,16 +163,6 @@ def enable_packed_decode(codec: nn.Module, chunk_frames: int) -> int:
     return count
 
 
-@support_torch_compile(dynamic_arg_dims={"codes": 2})
-class _PackedDecodeCompileAdapter(nn.Module):
-    def __init__(self, codec: nn.Module, *, vllm_config: VllmConfig) -> None:
-        super().__init__()
-        self.codec = codec
-
-    def forward(self, codes: torch.Tensor, meta: torch.Tensor) -> torch.Tensor:
-        return decode_packed_tensors(self.codec, codes, meta)
-
-
 @dataclass
 class _PackedGraph:
     graph: CUDAGraph
@@ -203,7 +191,7 @@ class CUDAGraphPackedDecoderWrapper:
     ) -> None:
         self.codec = codec
         self._warmups = max(1, vllm_config.compilation_config.cudagraph_num_of_warmups)
-        # One-frame buckets are excluded: a size-1 dim would specialize the compiled graph.
+        # No one-frame bucket: a one-frame call replays the two-frame graph.
         self.frame_sizes = sorted({int(size) for size in frame_sizes if int(size) >= 2})
         self.max_segments = int(max_segments)
         self.scratch_base = int(scratch_base)
@@ -215,13 +203,8 @@ class CUDAGraphPackedDecoderWrapper:
         self._stream: torch.cuda.Stream | None = None
         self._host: list[tuple[torch.Tensor, np.ndarray, torch.cuda.Event, bool]] = []
         self._host_index = 0
-        compile_config = copy.copy(vllm_config)
-        compile_config.compilation_config = copy.copy(vllm_config.compilation_config)
-        compile_config.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
-        compile_config.compilation_config.static_forward_context = {}
-        compile_config.compilation_config.traced_files = set()
-        with set_current_vllm_config(compile_config):
-            self._decode = _PackedDecodeCompileAdapter(codec, vllm_config=compile_config)
+        # This wrapper owns CUDA Graph capture/replay; the decode runs uncompiled.
+        self._decode = functools.partial(decode_packed_tensors, codec)
 
     @property
     def max_frames(self) -> int:

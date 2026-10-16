@@ -239,6 +239,66 @@ def test_packed_session_matches_mixed_length_streams_and_slot_reuse():
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @torch.no_grad()
+def test_packed_decoder_splits_long_chunks_into_ordered_rounds():
+    import copy
+
+    from vllm.config import CompilationConfig, VllmConfig
+
+    from vllm_omni.model_executor.models.moss_tts.modeling_moss_tts_codec import (
+        MossTTSCodecDecoder,
+        _MossCodecStreamSession,
+    )
+    from vllm_omni.model_executor.models.moss_tts.slot_attention import (
+        slot_ring_flash_attention,
+        slot_ring_flash_attention_rows,
+    )
+
+    config = tiny_codec().config
+    for entry in config.decoder_kwargs:
+        if entry.get("module_type") == "Transformer":
+            entry.update(d_model=64, num_heads=1, dim_feedforward=128)
+    reference = MossAudioTokenizerModel(config).eval().cuda()
+    reference.decoder.to(torch.bfloat16)
+    reference.quantizer.build_decode_lut(2, dtype=torch.bfloat16)
+    candidate = copy.deepcopy(reference)
+    for codec in (reference, candidate):
+        for module in codec.decoder.modules():
+            if hasattr(module, "_slot_attention"):
+                module._slot_attention = slot_ring_flash_attention
+                module._slot_attention_rows = slot_ring_flash_attention_rows
+    kwargs = dict(
+        state_capacity=2,
+        n_vq=2,
+        gpu_output=True,
+        chunk_frames=3,
+        graph_batch_sizes=[1, 2],
+        graph_frame_sizes=[1, 2, 3],
+        vllm_config=VllmConfig(compilation_config=CompilationConfig(mode=0)),
+    )
+    plain = _MossCodecStreamSession(reference, **kwargs)
+    packed = _MossCodecStreamSession(candidate, **kwargs, packed=True)
+    assert packed._cudagraph_wrapper is None
+    decoder = object.__new__(MossTTSCodecDecoder)
+    torch.nn.Module.__init__(decoder)
+    decoder._codec = candidate
+    decoder._stream_session = packed
+    decoder._stream_req_slots = {}
+    decoder._stream_state_capacity = 2
+    decoder._stream_max_step_frames = 3
+    long, tail = torch.randint(0, 16, (2, 7), device="cuda"), torch.randint(0, 16, (2, 2), device="cuda")
+    actual = decoder._decode_streaming_batch([(0, "long", long, False), (1, "tail", tail, True)])
+    # The 7-frame chunk decodes as 3 + 3 + 1 frames, in order, next to the terminal tail.
+    a, b = plain.acquire(), plain.acquire()
+    expected_long = torch.cat([plain.step({a: long[:, s : s + 3]})[a] for s in (0, 3, 6)], dim=-1)
+    expected_tail = plain.step({b: tail}, terminal_slots={b})[b]
+    torch.testing.assert_close(actual[0], expected_long, rtol=0.03, atol=0.01)
+    torch.testing.assert_close(actual[1], expected_tail, rtol=0.03, atol=0.01)
+    assert set(decoder._stream_req_slots) == {"long"}
+
+
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@torch.no_grad()
 def test_one_frame_one_batch_retains_ordinary_decode():
     from vllm.config import CompilationConfig, VllmConfig
 
