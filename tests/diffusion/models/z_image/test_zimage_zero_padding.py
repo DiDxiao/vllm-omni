@@ -27,7 +27,7 @@ def test_image_padding_detection_uses_host_shape_metadata():
 def test_patchify_does_not_materialize_empty_image_padding():
     transformer = _bare_transformer()
     caption = [torch.arange(12, dtype=torch.float32).reshape(3, 4)]
-    image = torch.arange(4, dtype=torch.float32).reshape(1, 1, 2, 2)
+    image = torch.arange(32, dtype=torch.float32).reshape(1, 1, 4, 8)
 
     outputs = transformer.patchify_and_embed(
         [image],
@@ -36,7 +36,7 @@ def test_patchify_does_not_materialize_empty_image_padding():
         f_patch_size=1,
     )
 
-    assert outputs[0][0].shape == (4, 1)
+    assert outputs[0][0].shape == (32, 1)
     assert outputs[0][0].data_ptr() == image.data_ptr()
 
 
