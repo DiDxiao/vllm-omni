@@ -21,6 +21,7 @@ import os
 from collections.abc import Callable, Iterable
 from typing import Any, ClassVar
 
+import nvtx
 import PIL.Image
 import torch
 import torch.nn as nn
@@ -397,6 +398,7 @@ class ZImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, SupportsComponen
 
         return embeddings_list
 
+    @nvtx.annotate("zimage.prepare_latents")
     def prepare_latents(
         self,
         batch_size,
@@ -421,14 +423,15 @@ class ZImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, SupportsComponen
 
             image = image.to(device=device, dtype=dtype)
             if image.shape[1] != num_channels_latents:
-                if isinstance(generator, list):
-                    image_latents = [
-                        retrieve_latents(self.vae.encode(image[i : i + 1]), generator=generator[i])
-                        for i in range(image.shape[0])
-                    ]
-                    image_latents = torch.cat(image_latents, dim=0)
-                else:
-                    image_latents = retrieve_latents(self.vae.encode(image), generator=generator)
+                with nvtx.annotate("zimage.vae_encode"):
+                    if isinstance(generator, list):
+                        image_latents = [
+                            retrieve_latents(self.vae.encode(image[i : i + 1]), generator=generator[i])
+                            for i in range(image.shape[0])
+                        ]
+                        image_latents = torch.cat(image_latents, dim=0)
+                    else:
+                        image_latents = retrieve_latents(self.vae.encode(image), generator=generator)
 
                 image_latents = (image_latents - self.vae.config.shift_factor) * self.vae.config.scaling_factor
             else:
@@ -482,6 +485,7 @@ class ZImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, SupportsComponen
     def interrupt(self):
         return self._interrupt
 
+    @nvtx.annotate("zimage.request")
     def forward(self, req: DiffusionRequestBatch) -> DiffusionOutput:
         # TODO: In online mode, sometimes it receives [{"negative_prompt": None}, {...}], so cannot use .get("...", "")
         # TODO: May be some data formatting operations on the API side. Hack for now.
@@ -564,18 +568,19 @@ class ZImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, SupportsComponen
         # 2. Define call parameters
         batch_size = len(prompt)
 
-        (
-            prompt_embeds,
-            negative_prompt_embeds,
-        ) = self.encode_prompt(
-            prompt=prompt,
-            negative_prompt=negative_prompt,
-            do_classifier_free_guidance=self.do_classifier_free_guidance,
-            prompt_embeds=prompt_embeds,
-            negative_prompt_embeds=negative_prompt_embeds,
-            device=device,
-            max_sequence_length=max_sequence_length,
-        )
+        with nvtx.annotate("zimage.text_encode"):
+            (
+                prompt_embeds,
+                negative_prompt_embeds,
+            ) = self.encode_prompt(
+                prompt=prompt,
+                negative_prompt=negative_prompt,
+                do_classifier_free_guidance=self.do_classifier_free_guidance,
+                prompt_embeds=prompt_embeds,
+                negative_prompt_embeds=negative_prompt_embeds,
+                device=device,
+                max_sequence_length=max_sequence_length,
+            )
 
         # 4. Prepare latent variables
         num_channels_latents = self.transformer.in_channels
@@ -588,8 +593,9 @@ class ZImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, SupportsComponen
 
             # Prepare image for VAE encoding using image_processor
             if not isinstance(image, torch.Tensor):
-                init_image = self.image_processor.preprocess(image, height, width)
-                image = init_image.to(dtype=torch.float32, device=device)
+                with nvtx.annotate("zimage.image_preprocess"):
+                    init_image = self.image_processor.preprocess(image, height, width)
+                    image = init_image.to(dtype=torch.float32, device=device)
 
             # Initialize scheduler kwargs for img2img
             mu = calculate_shift(
@@ -696,6 +702,7 @@ class ZImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, SupportsComponen
         caption_context_cache: dict[bool, tuple] = {}
 
         # 6. Denoising loop
+        nvtx.push_range("zimage.denoise")
         for i, t in enumerate(timesteps):
             if self.interrupt:
                 continue
@@ -816,6 +823,7 @@ class ZImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, SupportsComponen
                 latents = callback_outputs.pop("latents", latents)
                 prompt_embeds = callback_outputs.pop("prompt_embeds", prompt_embeds)
                 negative_prompt_embeds = callback_outputs.pop("negative_prompt_embeds", negative_prompt_embeds)
+        nvtx.pop_range()
 
         if output_type == "latent":
             image = latents
@@ -823,7 +831,8 @@ class ZImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, SupportsComponen
             latents = latents.to(self.vae.dtype)
             latents = (latents / self.vae.config.scaling_factor) + self.vae.config.shift_factor
 
-            image = self.vae.decode(latents, return_dict=False)[0]
+            with nvtx.annotate("zimage.vae_decode"):
+                image = self.vae.decode(latents, return_dict=False)[0]
             # image = self.image_processor.postprocess(image, output_type=output_type)
 
         stage_durations = self.stage_durations if hasattr(self, "stage_durations") else None
