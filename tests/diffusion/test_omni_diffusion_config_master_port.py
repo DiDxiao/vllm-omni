@@ -2,8 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unit tests for OmniDiffusionConfig master_port resolution (issue #3794)."""
 
-import socket
-
 import pytest
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
@@ -70,11 +68,10 @@ class TestOmniDiffusionConfigMasterPort:
 
     def test_default_master_port_is_available(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv("MASTER_PORT", raising=False)
+        checked = _stub_port_availability(monkeypatch)
         config = OmniDiffusionConfig(model="test")
-        assert config.master_port is not None
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            sock.bind(("", config.master_port))
+        assert config.master_port == checked[0]
+        assert len(checked) == 1
 
     def test_settle_port_steps_when_port_is_busy(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv("MASTER_PORT", raising=False)
