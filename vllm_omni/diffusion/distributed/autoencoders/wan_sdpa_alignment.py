@@ -18,6 +18,8 @@ its original storage.
 
 from __future__ import annotations
 
+import warnings
+from importlib import metadata
 from types import MethodType
 
 import torch
@@ -108,12 +110,28 @@ def install_wan_attention_sdpa_alignment(root: nn.Module) -> None:
 
     Idempotent. Installed at decode/encode time so the Wan fast path, which
     rejects a custom forward at install time, still sees the diffusers method
-    while the model is loading.
+    while the model is loading. Existing spatial-shard wrappers are preserved:
+    they gather the full spatial extent before attention, rather than tiles.
+    Warn on unverified diffusers versions because the forward is copied from
+    0.40.0; keep the alignment fix active rather than restoring the tile crash.
     """
     if getattr(root, _ROOT_ATTR, False):
         return
+    diffusers_version = metadata.version("diffusers")
+    if diffusers_version != "0.40.0":
+        warnings.warn(
+            "Wan attention SDPA alignment was validated against diffusers 0.40.0, "
+            f"but {diffusers_version} is installed. The copied WanAttentionBlock.forward "
+            "must be checked against this version for compatibility.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
     for module in root.modules():
         if module.__class__.__name__ != "WanAttentionBlock":
+            continue
+        # LingBot installs this wrapper before the first decode. Replacing it
+        # would drop the all-gather/reshard and silently attend to local shards.
+        if getattr(module, "_vllm_omni_spatial_shard_attention", False):
             continue
         module.forward = MethodType(aligned_wan_attention_forward, module)
     setattr(root, _ROOT_ATTR, True)

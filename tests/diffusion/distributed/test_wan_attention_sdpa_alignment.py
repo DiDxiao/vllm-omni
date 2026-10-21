@@ -13,6 +13,8 @@ kernel; they check the stride condition and that realignment preserves values.
 
 from __future__ import annotations
 
+import warnings
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -172,3 +174,62 @@ def test_aligned_forward_matches_unaligned_math(dtype: torch.dtype, height: int,
     forward = block.forward
     install_wan_attention_sdpa_alignment(root)
     assert block.forward is forward
+
+
+@pytest.mark.parametrize("alignment_first", [False, True])
+def test_alignment_preserves_spatial_shard_gather(monkeypatch, alignment_first: bool) -> None:
+    """Both installation orders must retain global attention before resharding."""
+    from diffusers.models.autoencoders.autoencoder_kl_wan import WanAttentionBlock as DiffusersWanAttentionBlock
+
+    from vllm_omni.diffusion.distributed.autoencoders import wan_spatial_shard
+
+    torch.manual_seed(0)
+    block = DiffusersWanAttentionBlock(32)
+    root = _Root(block)
+    local = torch.randn(1, 32, 1, 2, 2)
+    remote = torch.randn_like(local)
+    full = torch.cat((local, remote), dim=-1)
+    expected = block(full)[..., :2]
+    calls = []
+
+    def gather(x, *, group, dim):
+        calls.append(dim)
+        return torch.cat((x, remote), dim=dim)
+
+    monkeypatch.setattr(wan_spatial_shard, "_rank_world", lambda group: (0, 2))
+    monkeypatch.setattr(wan_spatial_shard, "all_gather_along_dim", gather)
+    if alignment_first:
+        install_wan_attention_sdpa_alignment(root)
+    wan_spatial_shard._patch_attention_block(block, None, "width")
+    sharded_forward = block.forward
+    install_wan_attention_sdpa_alignment(root)
+    assert block.forward is sharded_forward
+    actual = block(local)
+    assert calls == [-1]
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("installed_version", ["0.40.0", "0.41.0", "0.40.0.dev0"])
+def test_alignment_warns_on_unverified_diffusers_version(monkeypatch, installed_version: str) -> None:
+    """A dependency upgrade must not silently retain the copied forward."""
+    from importlib import metadata
+
+    original_version = metadata.version
+    monkeypatch.setattr(
+        metadata, "version", lambda name: installed_version if name == "diffusers" else original_version(name)
+    )
+    root = _Root(WanAttentionBlock(32, torch.float32))
+    with warnings.catch_warnings(record=True) as recorded:
+        warnings.simplefilter("always")
+        install_wan_attention_sdpa_alignment(root)
+        forward = root.block.forward
+        install_wan_attention_sdpa_alignment(root)
+    assert root.block.forward is forward
+    if installed_version == "0.40.0":
+        assert not recorded
+    else:
+        assert len(recorded) == 1
+        assert "validated against diffusers 0.40.0" in str(recorded[0].message)
+        assert installed_version in str(recorded[0].message)
+    hidden = torch.randn(1, 32, 1, 1, 1)
+    assert torch.equal(root.block(hidden), _reference_attention(root.block, hidden))
