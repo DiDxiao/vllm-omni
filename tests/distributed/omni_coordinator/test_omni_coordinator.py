@@ -5,6 +5,7 @@ import json
 import threading
 import time
 from collections.abc import Callable
+from unittest.mock import Mock
 
 import pytest
 import zmq
@@ -247,6 +248,7 @@ def test_omni_coordinator_publish_does_not_drop_inflight_registration(coord_env:
         while time.time() < deadline:
             with coordinator._lock:
                 registered = len(coordinator._replicas)
+            with coordinator._pending_lock:
                 pending = coordinator._pending_broadcast
             if registered >= 3 and pending:
                 break
@@ -261,6 +263,37 @@ def test_omni_coordinator_publish_does_not_drop_inflight_registration(coord_env:
     assert msg is not None, "in-flight registrations were dropped until the next keepalive"
     input_addrs = {rep["input_addr"] for rep in msg["replicas"]}
     assert input_addrs == {"tcp://stage:10001", "tcp://stage:10002", "tcp://stage:10003"}
+
+
+def test_omni_coordinator_retries_failed_publish_without_new_events(coord_env: _CoordEnv, monkeypatch):
+    """Retry a failed send on the next tick without another event or keepalive."""
+    coordinator = coord_env.coordinator(heartbeat_timeout=1000.0)
+    # Drive the production loop synchronously after stopping its worker threads.
+    coordinator._running = False
+    coordinator._stop_event.set()
+    coordinator._recv_thread.join(timeout=2.0)
+    coordinator._periodic_thread.join(timeout=2.0)
+    assert not coordinator._recv_thread.is_alive()
+    assert not coordinator._periodic_thread.is_alive()
+    coordinator._running = True
+
+    publish = Mock(side_effect=[False, True])
+    heartbeat_check = Mock()
+    wait = Mock(side_effect=[False, True])
+    monkeypatch.setattr(coordinator, "publish_replica_list_update", publish)
+    monkeypatch.setattr(coordinator, "_check_heartbeat_timeouts", heartbeat_check)
+    monkeypatch.setattr(coordinator._stop_event, "wait", wait)
+    # The first tick schedules a keepalive; frozen time prevents another one.
+    monkeypatch.setattr("vllm_omni.distributed.omni_coordinator.omni_coordinator.time", lambda: 100.0)
+
+    coordinator._periodic_loop()
+
+    assert publish.call_count == 2
+    heartbeat_check.assert_called_once_with()
+    assert wait.call_count == 2
+    assert all(call.kwargs == {"timeout": coordinator._publish_min_interval} for call in wait.call_args_list)
+    with coordinator._pending_lock:
+        assert not coordinator._pending_broadcast
 
 
 def test_omni_coordinator_heartbeat_timeout_handling(coord_env: _CoordEnv):
