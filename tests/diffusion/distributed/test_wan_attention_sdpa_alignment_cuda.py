@@ -2,10 +2,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Real Wan attention regression for the CUDA memory-efficient SDPA backend.
 
-No checkpoint is needed. The unpatched 1x1 control reproduces the strideM
-failure; the installed patch must run and match the math backend. This is
-kernel coverage, not the Cosmos3-Nano multi-rank tiled-decode acceptance run.
+No checkpoint is needed. The installed patch must run under the memory-efficient
+backend and match the math backend. A torch build that still rejects an
+unpatched 1x1 query records that strideM error and continues; a build that
+accepts the query does not fail this case. This is kernel coverage, not the
+Cosmos3-Nano multi-rank tiled-decode acceptance run.
 """
+
+import re
 
 import pytest
 import torch
@@ -31,9 +35,15 @@ def test_real_wan_attention_memory_efficient_sdpa(dtype: torch.dtype, height: in
         with sdpa_kernel(SDPBackend.MATH):
             expected = block(hidden)
         if (height, width) == (1, 1):
+            # Current memory-efficient SDPA rejects this query. A later torch
+            # that accepts it should not fail the regression; the patched
+            # comparison below is what guards the fix.
             with sdpa_kernel(SDPBackend.EFFICIENT_ATTENTION):
-                with pytest.raises(RuntimeError, match="not correctly aligned.*strideM"):
+                try:
                     block(hidden)
+                except RuntimeError as exc:
+                    if re.search(r"not correctly aligned.*strideM", str(exc)) is None:
+                        raise
         else:
             with sdpa_kernel(SDPBackend.EFFICIENT_ATTENTION):
                 unpatched = block(hidden)
