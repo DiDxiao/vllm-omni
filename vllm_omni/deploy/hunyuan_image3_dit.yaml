@@ -2,6 +2,9 @@
 #
 # Use this for standalone DiT/offline execution. This file resolves to one
 # diffusion stage with stage_id 0 and does not depend on the AR stage.
+#
+# CI note: nightly perf baselines for this deploy live under
+# tests/dfx/perf/tests/test_hunyuan_image_*.json.
 pipeline: hunyuan_image3_dit
 async_chunk: false
 
