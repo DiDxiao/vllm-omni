@@ -143,6 +143,38 @@ class VideoGenerationRequest(BaseModel):
 
     # vllm-omni extensions for diffusion control
     negative_prompt: str | None = Field(default=None, description="Text describing what to avoid in the video")
+
+    # vllm-omni extension: regenerate the tail of a previous streaming session
+    # from a given frame using the new prompt, reusing the saved prefix latents.
+    regenerate_from_session_id: str | None = Field(
+        default=None,
+        description=(
+            "Session (request) id of a previously completed streaming video generation "
+            "to continue from. The saved historical latents for that session are reused "
+            "to avoid re-denosing the prefix. Must be used together with "
+            "regenerate_from_frame."
+        ),
+    )
+    regenerate_from_frame: int | None = Field(
+        default=None,
+        ge=0,
+        description=(
+            "Frame index (0-based, in output pixels) of the referenced session from which "
+            "to regenerate. Only the tail starting at this frame is re-denosed with the "
+            "new prompt. Must be used together with regenerate_from_session_id."
+        ),
+    )
+    regenerate_prompt_transition_chunks: int | None = Field(
+        default=None,
+        ge=0,
+        description=(
+            "Number of chunks over which the regenerated tail linearly transitions from "
+            "the historical session's prompt to the new prompt (default 3). The first "
+            "regenerated chunk keeps conditioning on the historical prompt and the "
+            "following transition_chunks chunks blend toward the new prompt. 0 applies "
+            "the new prompt immediately. Only used together with regenerate_from_session_id."
+        ),
+    )
     num_inference_steps: int | None = Field(
         default=None,
         ge=1,

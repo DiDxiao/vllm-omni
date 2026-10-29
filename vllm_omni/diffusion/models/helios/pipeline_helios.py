@@ -29,7 +29,7 @@ from vllm_omni.diffusion.models.helios.scheduling_helios import HeliosScheduler
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
-from vllm_omni.diffusion.prompt_update import PromptUpdateMixin
+from vllm_omni.diffusion.prompt_update import DEFAULT_TRANSITION_CHUNKS, PromptUpdateMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.platforms import current_omni_platform
@@ -448,27 +448,56 @@ class HeliosPipeline(
         if not keep_first_frame:
             history_sizes[-1] = history_sizes[-1] + 1
 
-        history_latents = torch.zeros(
-            batch_size,
-            num_channels_latents,
-            num_history_latent_frames,
-            height // self.vae_scale_factor_spatial,
-            width // self.vae_scale_factor_spatial,
-            device=device,
-            dtype=torch.float32,
-        )
-        if fake_image_latents is not None:
-            history_latents = torch.cat([history_latents[:, :, :-1, :, :], fake_image_latents], dim=2)
-            total_generated_latent_frames += 1
-        if video_latents is not None:
-            history_frames = history_latents.shape[2]
-            video_frames = video_latents.shape[2]
-            if video_frames < history_frames:
-                keep_frames = history_frames - video_frames
-                history_latents = torch.cat([history_latents[:, :, :keep_frames, :, :], video_latents], dim=2)
-            else:
-                history_latents = video_latents
-            total_generated_latent_frames += video_latents.shape[2]
+        # Regenerate the tail of a previous session from a saved snapshot.
+        # The runner injects `regenerate_from_snapshot` + `regenerate_from_start_frame`
+        # into `state.extra` before calling `prepare_encode()`.
+        start_chunk = 0
+        regenerate_snapshot = state.extra.get("regenerate_from_snapshot")
+        regeneration_prefix_video: torch.Tensor | None = None
+        if regenerate_snapshot is not None:
+            regenerate_start_frame = int(state.extra.get("regenerate_from_start_frame") or 0)
+            (
+                history_latents,
+                total_generated_latent_frames,
+                image_latents,
+                start_chunk,
+                num_latent_chunk,
+                regeneration_prefix_video,
+            ) = self._seed_history_from_snapshot(
+                regenerate_snapshot,
+                regenerate_start_frame,
+                num_history_latent_frames=num_history_latent_frames,
+                num_frames=num_frames,
+                height=height,
+                width=width,
+                device=device,
+                dtype=torch.float32,
+                vae_dtype=self.vae.dtype,
+                latents_mean=latents_mean,
+                latents_std=latents_std,
+            )
+        else:
+            history_latents = torch.zeros(
+                batch_size,
+                num_channels_latents,
+                num_history_latent_frames,
+                height // self.vae_scale_factor_spatial,
+                width // self.vae_scale_factor_spatial,
+                device=device,
+                dtype=torch.float32,
+            )
+            if fake_image_latents is not None:
+                history_latents = torch.cat([history_latents[:, :, :-1, :, :], fake_image_latents], dim=2)
+                total_generated_latent_frames += 1
+            if video_latents is not None:
+                history_frames = history_latents.shape[2]
+                video_frames = video_latents.shape[2]
+                if video_frames < history_frames:
+                    keep_frames = history_frames - video_frames
+                    history_latents = torch.cat([history_latents[:, :, :keep_frames, :, :], video_latents], dim=2)
+                else:
+                    history_latents = video_latents
+                total_generated_latent_frames += video_latents.shape[2]
 
         if keep_first_frame:
             indices = torch.arange(0, sum([1, *history_sizes, num_latent_frames_per_chunk]))
@@ -492,7 +521,30 @@ class HeliosPipeline(
         state.prompt_embeds = prompt_embeds
         state.negative_prompt_embeds = negative_prompt_embeds
         state.do_true_cfg = self.do_classifier_free_guidance
-        state.chunk_index = 0
+
+        # Smooth prompt transition on tail-regeneration: when this request
+        # regenerates from a saved session that cached its (old) prompt embedding,
+        # start blending from the old prompt toward the new prompt on the *first*
+        # regenerated chunk (rather than waiting for the first chunk boundary),
+        # so the transition completes within ``transition_chunks`` chunks. This
+        # reuses the same interpolation machinery as mid-stream prompt updates.
+        regenerate_snapshot = state.extra.get("regenerate_from_snapshot")
+        old_prompt_embeds = (
+            regenerate_snapshot.get("prompt_embeds")
+            if regenerate_snapshot is not None and regenerate_snapshot.get("prompt_embeds") is not None
+            else None
+        )
+        if old_prompt_embeds is not None:
+            transition_chunks = int(extra.get("regenerate_prompt_transition_chunks", DEFAULT_TRANSITION_CHUNKS))
+            self.start_prompt_transition(
+                state,
+                source_prompt_embeds=old_prompt_embeds.to(device=prompt_embeds.device, dtype=prompt_embeds.dtype),
+                target_prompt_embeds=prompt_embeds,
+                prompt=prompt,
+                event_id=f"regen-transition-{state.request_id}",
+                transition_chunks=transition_chunks,
+            )
+        state.chunk_index = start_chunk
         state.step_in_chunk = 0
         state.total_chunks = num_latent_chunk
         state.extra.update(
@@ -505,8 +557,9 @@ class HeliosPipeline(
                 "height": height,
                 "history_latents": history_latents,
                 "history_sizes": history_sizes,
-                "history_video": None,
+                "history_video": regeneration_prefix_video,
                 "image_latents": image_latents,
+                "regeneration_prefix_video": regeneration_prefix_video,
                 "indices_hidden_states": indices_hidden_states.unsqueeze(0),
                 "indices_latents_history_long": indices_latents_history_long.unsqueeze(0),
                 "indices_latents_history_mid": indices_latents_history_mid.unsqueeze(0),
@@ -899,6 +952,11 @@ class HeliosPipeline(
             extra["history_video"] = torch.cat([extra["history_video"], current_video], dim=2)
 
         output = current_latents if extra["output_type"] == "latent" else current_video
+        # Tail-regeneration: prepend the directly-decoded (unchanged) prefix
+        # frames to the first regenerated chunk so the streamed video starts
+        # from frame 0 rather than from the regeneration point.
+        if extra.get("regeneration_prefix_video") is not None and extra["output_type"] != "latent":
+            output = torch.cat([extra.pop("regeneration_prefix_video"), output], dim=2)
         completed_chunk_index = state.chunk_index
         prompt_update_metadata = state.extra.pop("prompt_update_chunk_metadata", {})
         state.chunk_index += 1
@@ -922,6 +980,130 @@ class HeliosPipeline(
             completed_event_ids=prompt_update_metadata.get("completed_event_ids", []),
             finished=finished,
         )
+
+    # -- generation-session snapshot support -------------------------------
+    # Enables "regenerate the tail of a previous session from a frame" by
+    # persisting the accumulated latents and re-seeding a new request from them
+    # (       re-denosing the prefix). The store lives at the runner/diffusion
+    # layer; only the model-specific snapshot/seeding is implemented here.
+
+
+    def snapshot_generation_state(self, state: StepRequestState) -> dict[str, Any] | None:
+        """Serialize the current request's generation state for later resume.
+
+        The runner stores the returned payload inside a model-agnostic
+        :class:`GenerationSessionSnapshot` keyed by the session (request) id.
+        The payload keeps the accumulated, already-normalized latents plus the
+        metadata needed to resume generation from an arbitrary frame without
+        re-denosing the prefix.
+        """
+        extra = state.extra
+        history_latents = extra.get("history_latents")
+        if history_latents is None:
+            return None
+        return {
+            "history_latents": history_latents.detach(),
+            # Cache the finishing prompt embedding so a later tail-regeneration
+            # can smoothly transition from the old prompt to the new one over
+            # several chunks instead of switching sharply.
+            "prompt_embeds": state.prompt_embeds.detach() if state.prompt_embeds is not None else None,
+            "num_latent_frames_per_chunk": extra["num_latent_frames_per_chunk"],
+            "keep_first_frame": extra["keep_first_frame"],
+            "history_sizes": list(extra["history_sizes"]),
+            "total_generated_latent_frames": int(extra["total_generated_latent_frames"]),
+            "num_frames": int(getattr(state.sampling, "num_frames", None) or 0),
+            "width": extra["width"],
+            "height": extra["height"],
+        }
+
+    def _seed_history_from_snapshot(
+        self,
+        regenerate_snapshot: dict[str, Any],
+        regenerate_start_frame: int,
+        *,
+        num_history_latent_frames: int,
+        num_frames: int,
+        height: int,
+        width: int,
+        device: torch.device,
+        dtype: torch.dtype,
+        vae_dtype: torch.dtype,
+        latents_mean: torch.Tensor,
+        latents_std: torch.Tensor,
+    ) -> tuple[torch.Tensor, int, torch.Tensor | None, int, int, torch.Tensor | None]:
+        """Seed the conditioning history from a saved snapshot for tail regeneration.
+
+        ``history_latents`` stays at its **training-fixed window size**
+        (``num_history_latent_frames``); it is filled with the most recent
+        ``k = min(prefix_real, window)`` real prefix latents (zero-padded in
+        front). Frames before ``start_frame`` are *not* re-generated: their
+        latents are decoded directly into ``prefix_video`` so they can be
+        emitted as the leading output frames.
+
+        Returns ``(history_latents, total_generated_latent_frames,
+        image_latents, start_chunk, total_chunks, prefix_video)``.
+        """
+        snap_hist = regenerate_snapshot["history_latents"].to(device=device, dtype=dtype)
+        src_num_latent_per_chunk = int(regenerate_snapshot["num_latent_frames_per_chunk"])
+        src_keep_first = bool(regenerate_snapshot["keep_first_frame"])
+        src_total_generated = int(regenerate_snapshot["total_generated_latent_frames"])
+        if int(regenerate_snapshot["width"]) != width or int(regenerate_snapshot["height"]) != height:
+            raise ValueError(
+                "regenerate_from_* requires the same width/height as the original session "
+                f"(saved {regenerate_snapshot['width']}x{regenerate_snapshot['height']}, "
+                f"requested {width}x{height})."
+            )
+
+        new_latent_per_chunk = src_num_latent_per_chunk - (1 if src_keep_first else 0)
+        # New pixel frames contributed per chunk boundary (excludes the kept first
+        # frame); only used to map a start frame to its containing chunk.
+        pixel_per_chunk = new_latent_per_chunk * self.vae_scale_factor_temporal
+        # Every chunk is denoised as a full window of ``num_latent_frames_per_chunk``
+        # latents and decoded to this many pixel frames.
+        chunk_px = (src_num_latent_per_chunk - 1) * self.vae_scale_factor_temporal + 1
+        src_total_chunks = max(1, src_total_generated // src_num_latent_per_chunk)
+
+        start_chunk = min(max(regenerate_start_frame // pixel_per_chunk, 0), src_total_chunks - 1)
+
+        # Real (already-denosed) latent frames generated by chunks [0, start_chunk),
+        # and the pixel frames they decode to (leading, non-re-generated output).
+        prefix_real = 0 if start_chunk == 0 else src_num_latent_per_chunk + (start_chunk - 1) * new_latent_per_chunk
+        prefix_px = 0 if prefix_real == 0 else (prefix_real - 1) * self.vae_scale_factor_temporal + 1
+
+        # ``num_frames`` is the total output pixel length of the regenerated video:
+        # ``prefix_px`` leading frames come straight from the cached session, and the
+        # remainder is filled with whole freshly regenerated chunks of ``chunk_px``
+        # pixel frames each, so the total stays equal to ``num_frames``.
+        tail_px = max(num_frames - prefix_px, chunk_px)
+        tail_chunks = max(1, (tail_px + chunk_px - 1) // chunk_px)
+
+        real = snap_hist[:, :, -src_total_generated:]  # the actually-generated region
+        batch, channels, _, h, w = real.shape
+        prefix_video: torch.Tensor | None = None
+        if prefix_real > 0:
+            prefix = real[:, :, :prefix_real]
+            # First frame of the last kept chunk: used as the short-history prefix.
+            image_latents = prefix[:, :, -src_num_latent_per_chunk : -(src_num_latent_per_chunk - 1)]
+            # Directly decode the kept prefix frames so they can be emitted as the
+            # leading output frames (they are not re-generated).
+            prefix_video = self.vae.decode(
+                prefix.to(vae_dtype) / latents_std + latents_mean, return_dict=False
+            )[0]
+        else:
+            prefix = None
+            image_latents = None
+
+        # Conditioning history stays at the fixed training window size. Fill its
+        # tail with the most recent real prefix latents; leading slots stay zero.
+        k = min(prefix_real, num_history_latent_frames)
+        history_latents = torch.zeros(
+            batch, channels, num_history_latent_frames, h, w, device=device, dtype=dtype
+        )
+        if k > 0:
+            history_latents[:, :, num_history_latent_frames - k :] = prefix[:, :, -k:]
+
+        total_chunks = start_chunk + tail_chunks
+        return history_latents, k, image_latents, start_chunk, total_chunks, prefix_video
 
     def forward(
         self,

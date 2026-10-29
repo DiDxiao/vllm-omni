@@ -103,6 +103,64 @@ class PromptUpdateMixin:
                 "transition_chunks": duration,
             }
 
+    def start_prompt_transition(
+        self,
+        state: StepRequestState,
+        *,
+        source_prompt_embeds: torch.Tensor,
+        target_prompt_embeds: torch.Tensor,
+        prompt: str,
+        event_id: str,
+        transition_chunks: int,
+    ) -> None:
+        """Start a prompt transition immediately, with the first interpolation step applied.
+
+        Unlike :meth:`prepare_prompt_update` (which queues the update to be consumed
+        at the *next* chunk boundary and thus leaves the current chunk on the old
+        prompt), this applies the first blend step right away, so the current
+        chunk already conditions on a prompt that moves toward
+        ``target_prompt_embeds``. Subsequent chunks keep advancing the transition
+        via :meth:`_apply_prompt_update_at_chunk_boundary`.
+
+        Used by tail-regeneration to begin blending from the historical session's
+        prompt to the new prompt on the *first* regenerated chunk.
+        """
+        if transition_chunks < 0:
+            raise ValueError("transition_chunks must be >= 0")
+        extra = cast(PromptUpdateExtra, state.extra)
+        with self._prompt_update_lock(extra):
+            if transition_chunks <= 0:
+                # A hard/immediate transition: the current chunk already uses the target.
+                state.prompt_embeds = target_prompt_embeds
+                extra["prompt_update_chunk_metadata"] = {
+                    "started_event_ids": [event_id],
+                    "active_event_ids": [event_id],
+                    "completed_event_ids": [event_id],
+                }
+                extra["prompt_update_version"] = int(extra.get("prompt_update_version", 0)) + 1
+                return
+
+            update_state = _PromptUpdateState(
+                source_prompt_embeds=source_prompt_embeds,
+                target_prompt_embeds=target_prompt_embeds,
+                transition_chunks=transition_chunks,
+                event_id=event_id,
+                target_prompt=prompt,
+            )
+            update_state.advance_transition()
+            state.prompt_embeds = update_state.blended_prompt_embeds()
+            completed = update_state.elapsed_transition_chunks >= update_state.transition_chunks
+            if completed:
+                state.prompt_embeds = update_state.target_prompt_embeds
+                update_state.source_prompt_embeds = update_state.target_prompt_embeds
+            extra["prompt_update_state"] = update_state
+            extra["prompt_update_version"] = int(extra.get("prompt_update_version", 0)) + 1
+            extra["prompt_update_chunk_metadata"] = {
+                "started_event_ids": [event_id],
+                "active_event_ids": [event_id],
+                "completed_event_ids": [event_id] if completed else [],
+            }
+
     def _apply_prompt_update_at_chunk_boundary(self, state: StepRequestState) -> None:
         """Advance or start prompt interpolation before the next chunk."""
         extra = cast(PromptUpdateExtra, state.extra)

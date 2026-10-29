@@ -54,6 +54,7 @@ from vllm_omni.entrypoints.openai.stage_params import (
 from vllm_omni.entrypoints.openai.utils import get_stage_type, parse_lora_request
 from vllm_omni.entrypoints.openai.video_api_utils import (
     StreamingVideoFormat,
+    VideoFrames,
     create_streaming_video_encoder,
     decode_input_reference,
 )
@@ -71,7 +72,7 @@ logger = init_logger(__name__)
 _DEFAULT_STALL_TIMEOUT = 60.0
 _DEFAULT_START_TIMEOUT = 10.0
 _CONTROL_POLL_INTERVAL = 1.0
-_MAX_START_MESSAGE_SIZE = 4 * 1024 * 1024
+_MAX_START_MESSAGE_SIZE = 256 * 1024 * 1024
 _MAX_CONTROL_MESSAGE_SIZE = 128 * 1024
 
 
@@ -548,6 +549,18 @@ class OmniStreamingVideoOutputHandler:
         if "flow_shift" in provided_fields and request.flow_shift is not None:
             gen_params.extra_args["flow_shift"] = request.flow_shift
 
+        # Tail-regeneration from a previous streaming session.
+        if request.regenerate_from_session_id is not None or request.regenerate_from_frame is not None:
+            if request.regenerate_from_session_id is None or request.regenerate_from_frame is None:
+                raise HTTPException(
+                    status_code=HTTPStatus.BAD_REQUEST.value,
+                    detail="regenerate_from_session_id and regenerate_from_frame must be provided together.",
+                )
+            gen_params.extra_args["regenerate_from_session_id"] = request.regenerate_from_session_id
+            gen_params.extra_args["regenerate_from_frame"] = request.regenerate_from_frame
+            if request.regenerate_prompt_transition_chunks is not None:
+                gen_params.extra_args["regenerate_prompt_transition_chunks"] = request.regenerate_prompt_transition_chunks
+
         if request.extra_params is not None:
             if not isinstance(request.extra_params, dict):
                 raise HTTPException(
@@ -555,6 +568,31 @@ class OmniStreamingVideoOutputHandler:
                     detail="extra_params must be a JSON object/dict.",
                 )
             gen_params.extra_args.update(request.extra_params)
+
+        # Video-to-video reference: decode after extra_params so an explicit
+        # video_reference always takes precedence over any extra_params["video"].
+        input_video = await self._decode_video_reference(request)
+        if input_video is not None:
+            # Infer the target resolution from the reference video when the
+            # request does not pin one, then align to a multiple of 16 so the
+            # reference latent shape matches the pipeline's chunk latents.
+            if vp.width is None or vp.height is None:
+                first = input_video[0]
+                vp.width, vp.height = first.width, first.height
+            video_width = (int(vp.width) // 16) * 16
+            video_height = (int(vp.height) // 16) * 16
+            if video_width <= 0 or video_height <= 0:
+                raise HTTPException(
+                    HTTPStatus.BAD_REQUEST.value,
+                    detail="video_reference resolution is too small after 16px alignment.",
+                )
+            gen_params.width = video_width
+            gen_params.height = video_height
+            gen_params.extra_args["video"] = self._video_frames_to_tensor(
+                input_video,
+                width=video_width,
+                height=video_height,
+            )
 
         self._apply_lora(request.lora, gen_params)
         return prompt, gen_params, vp
@@ -575,6 +613,46 @@ class OmniStreamingVideoOutputHandler:
                 detail="image_reference must resolve to an image.",
             )
         return media_data
+
+    @staticmethod
+    async def _decode_video_reference(request: VideoGenerationRequest) -> VideoFrames | None:
+        try:
+            media_data = await decode_input_reference(
+                None,
+                request.video_reference,
+                None,
+            )
+        except InvalidInputReferenceError as exc:
+            raise HTTPException(HTTPStatus.BAD_REQUEST.value, detail=str(exc)) from exc
+        if media_data is not None and not isinstance(media_data, VideoFrames):
+            raise HTTPException(
+                HTTPStatus.BAD_REQUEST.value,
+                detail="video_reference must resolve to a video.",
+            )
+        return media_data
+
+    @staticmethod
+    def _video_frames_to_tensor(
+        frames: VideoFrames,
+        width: int | None,
+        height: int | None,
+    ) -> torch.Tensor:
+        """Convert a list of PIL frames into a [1, C, T, H, W] float32 tensor.
+
+        Frames are resized to the requested ``width`` x ``height`` when both are
+        given (otherwise the source resolution is preserved) and normalized to
+        the [-1, 1] pixel range expected by the Helios VAE.
+        """
+        if not frames:
+            raise HTTPException(HTTPStatus.BAD_REQUEST.value, detail="video_reference resolved to no frames.")
+        if width is not None and height is not None:
+            pil_frames = [frame.convert("RGB").resize((width, height)) for frame in frames]
+        else:
+            pil_frames = [frame.convert("RGB") for frame in frames]
+        arrays = np.stack([np.asarray(frame) for frame in pil_frames])  # [T, H, W, C]
+        tensor = torch.from_numpy(arrays).permute(3, 0, 1, 2).float()  # [C, T, H, W]
+        tensor = tensor / 127.5 - 1.0
+        return tensor.unsqueeze(0)  # [1, C, T, H, W]
 
     def _resolve_default_sampling_params(self) -> OmniDiffusionSamplingParams:
         default_sampling_params_list = self._engine_client.default_sampling_params_list
@@ -621,6 +699,11 @@ class OmniStreamingVideoOutputHandler:
                     status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
                     detail=f"Video generation only supports diffusion stages, found '{stage_type}' stage.",
                 )
+
+        # Carry the externally-visible (pre-uniquification) request id through to
+        # the runner, which keys generation-session snapshots by it so that the
+        # client's regenerate_from_session_id matches the stored snapshot key.
+        gen_params.extra_args["external_request_id"] = request_id
 
         sampling_params_list = build_stage_sampling_params_list(
             list(stage_configs),
