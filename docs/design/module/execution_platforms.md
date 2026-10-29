@@ -16,6 +16,16 @@ primary_code_path_owners:
     owners:
       - "@david6666666"
       - "@lishunyang12"
+  # Additional owner for the platform tree (not the shared attention package)
+  - paths:
+      - vllm_omni/platforms/**
+    owners:
+      - "@FayeSpica"
+  # Additional owner for the ROCm platform tree
+  - paths:
+      - vllm_omni/platforms/rocm/**
+    owners:
+      - "@haic0"
 related_code_paths: []
 depends_on:
   - ar_runtime.md
