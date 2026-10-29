@@ -25,9 +25,12 @@
 
 # CI
 /.buildkite/ @yenuo26 @congw729 @NickCao @haic0
+# Ascend NPU CI. Repeats the CI owners and appends the NPU owner.
+# Last-match-wins, so this must stay after /.buildkite/.
+/.buildkite/npu/ @yenuo26 @congw729 @NickCao @haic0 @FayeSpica
 
 # ComfyUI / external apps
-/apps/ @fhfuih @alex-jw-brooks @FayeSpica
+/apps/ @fhfuih @alex-jw-brooks
 
 # Benchmarks (out-of-tree)
 /benchmarks/accuracy/ @david6666666
@@ -83,13 +86,14 @@
 /vllm_omni/model_executor/ @tzhouam @gcanlin
 /vllm_omni/model_executor/models/ @tzhouam @gcanlin @Sy0307 @amy-why-3459 @linyueqian
 /vllm_omni/model_extras/ @tzhouam @gcanlin @princepride
-/vllm_omni/plugins/ @gcanlin @tjtanaa @xuechendi @FayeSpica
+/vllm_omni/plugins/ @gcanlin @tjtanaa @xuechendi
 
 # Execution platforms (hardware backends) — docs/design/module/execution_platforms.md
-/vllm_omni/platforms/ @gcanlin @tjtanaa @xuechendi @FayeSpica
-# ROCm subtree repeats the platform owners and appends the additional owner from
-# primary_code_path_owners. Last-match-wins, so this must stay after /platforms/.
-/vllm_omni/platforms/rocm/ @gcanlin @tjtanaa @xuechendi @FayeSpica @haic0
+/vllm_omni/platforms/ @gcanlin @tjtanaa @xuechendi
+# Vendor subtrees repeat the platform owners and append the additional owner from
+# primary_code_path_owners. Last-match-wins, so these must stay after /platforms/.
+/vllm_omni/platforms/npu/ @gcanlin @tjtanaa @xuechendi @FayeSpica
+/vllm_omni/platforms/rocm/ @gcanlin @tjtanaa @xuechendi @haic0
 /vllm_omni/attention/ @gcanlin @tjtanaa @xuechendi @david6666666 @lishunyang12
 
 # Configuration & deploy — docs/design/module/vllm_omni_config.md

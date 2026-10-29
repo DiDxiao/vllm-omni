@@ -36,7 +36,7 @@ Committers have write access and merge rights. They typically have deep expertis
 - [@alex-jw-brooks](https://github.com/alex-jw-brooks): Frontend, Configuration, and Entrypoint Support
 - [@amy-why-3459](https://github.com/amy-why-3459): Omni Modality Model and World Model Support
 - [@david6666666](https://github.com/david6666666): Quantization and Community Relationship
-- [@FayeSpica](https://github.com/FayeSpica): Ascend NPU / hardware plugins, ComfyUI frontend workflows
+- [@FayeSpica](https://github.com/FayeSpica): Ascend NPU platform and CI
 - [@gcanlin](https://github.com/gcanlin): Hardware plugin, NPU integration, and TTS Model Support
 - [@haic0](https://github.com/haic0): ROCm / MI300 CI and AMD platform coverage
 - [@Isotr0py](https://github.com/Isotr0py): Diffusion and Quantization

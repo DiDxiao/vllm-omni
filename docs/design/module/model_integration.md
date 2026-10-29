@@ -17,11 +17,6 @@ primary_code_path_owners:
       - "@Sy0307"
       - "@amy-why-3459"
       - "@linyueqian"
-  # Additional owner for hardware plugins (Ascend / platform plugins)
-  - paths:
-      - vllm_omni/plugins/**
-    owners:
-      - "@FayeSpica"
 related_code_paths:
   - vllm_omni/transformers_utils/**
   - vllm_omni/tokenizers/**
