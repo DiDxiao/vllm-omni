@@ -19,7 +19,7 @@
 
 ## 2. 架构总览
 
-特性拆成「模型无关的存储层」和「模型相关的快照/播种逻辑」两层，便于未来其它
+特性拆成「模型无关的存储层」和「模型相关的快照/历史恢复逻辑」两层，便于未来其它
 流式视频模型复用：
 
 ```text
@@ -40,12 +40,12 @@
 ┌──────────────────────────────▼──────────────────────────────────┐
 │ Pipeline 层 (pipeline_helios.py) —— 模型相关                    │
 │   snapshot_generation_state()    导出最终 history_latents 等     │
-│   _seed_history_from_snapshot()  由快照播种：前缀解码/窗口回填    │
+│   _seed_history_from_snapshot()  由快照恢复历史：前缀解码/窗口回填 │
 │   post_decode: 首个重生成 chunk 拼接前缀视频帧                    │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-**一句话总结**：存储在 Runner 层模型无关，快照/播种在 Pipeline 层模型相关，
+**一句话总结**：存储在 Runner 层模型无关，快照/历史恢复在 Pipeline 层模型相关，
 两层通过 `state.extra` 中不透明的 `payload` 解耦。
 
 ## 3. 核心概念
@@ -125,7 +125,7 @@ streaming 请求完成
             output = cat([prefix_video, current_video])    (:958)，随后 pop 该键只拼一次
 ```
 
-### 5.3 帧号 → chunk 映射（播种的核心几何）
+### 5.3 帧号 → chunk 映射（历史恢复的核心几何）
 
 设源会话每 chunk 生成 `new = num_latent_frames_per_chunk - keep_first` 个新
 latent 帧，时间下采样 `t = vae_scale_factor_temporal`，每 chunk 解码出的像素帧数
@@ -158,7 +158,7 @@ total_chunks         = start_chunk + tail_chunks
 | API | `vllm_omni/entrypoints/openai/serving_video_output_stream.py:552` | streaming 路径：成对校验 + `regenerate_prompt_transition_chunks` 透传 |
 | Runner | `vllm_omni/diffusion/worker/diffusion_model_runner.py:656` | 仅 `streaming_output=True` 且成功结束时才存快照（try/except 兜底，存失败只告警） |
 | Runner | `vllm_omni/diffusion/worker/diffusion_model_runner.py:691` | 未提供参数直接返回；只给其一抛错；快照不存在抛「已驱逐或未完成」 |
-| Pipeline | `vllm_omni/diffusion/models/helios/pipeline_helios.py:1019` | 分辨率不一致直接拒绝；`state.chunk_index = start_chunk` 跳过前缀去噪 |
+| Pipeline | `vllm_omni/diffusion/models/helios/pipeline_helios.py:1019` | 分辨率不一致直接拒绝；`state.chunk_index = start_chunk` 跳过前缀去噪（函数名中的 seed 指「用快照预置历史状态」，非随机种子） |
 | Pipeline | `vllm_omni/diffusion/models/helios/pipeline_helios.py:539` | 快照带 prompt 时首 chunk 立即应用第一插值步（不等 chunk 边界） |
 | Pipeline | `vllm_omni/diffusion/models/helios/pipeline_helios.py:958` | `regeneration_prefix_video` 只在首个重生成 chunk 拼接一次，用完即 `pop` |
 | Prompt | `vllm_omni/diffusion/prompt_update.py:106` | `start_prompt_transition`：`transition_chunks<=0` 立即切换；否则构造 `_PromptUpdateState` 并预先 `advance_transition()` 一步 |
@@ -168,10 +168,10 @@ total_chunks         = start_chunk + tail_chunks
 （`video_reference` → `[1,C,T,H,W]` 归一化张量，见
 `serving_video_output_stream.py` 中 `_decode_video_reference` /
 `_video_frames_to_tensor`），它走的正是上面 5.2 中未被重生成分支覆盖的
-`video_latents` 播种路径。
+`video_latents` 历史条件构建路径。
 
 **一句话总结**：API 层只做校验透传，Runner 层管存储与注入，Pipeline 层管几何与
-播种，客户端一个 flag 即可使用。
+历史恢复，客户端一个 flag 即可使用。
 
 ## 7. 参数示例
 
@@ -216,7 +216,7 @@ python streaming_video_client.py \
    实现 `snapshot_generation_state()` 钩子即可获得重生成能力（Runner 侧用
    `hasattr` 探测钩子决定是否保存）。
 2. **零拷贝显存复用**：快照 latent 全程留在 GPU，重生成时 device-to-device
-   切片播种，无 CPU 往返；驱逐即释放显存。
+   切片回填，无 CPU 往返；驱逐即释放显存。
 3. **前缀逐字节稳定**：前缀不做任何「重新去噪+截断」近似，直接解码原始 latent，
    保证与原会话视觉一致；`image_latents` 取最后保留 chunk 的第一帧，维持
    短历史条件与原图连续。
