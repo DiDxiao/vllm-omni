@@ -193,6 +193,16 @@ class OmniOpenAIServingVideo:
         if "sound_duration" in provided_fields and request.sound_duration is not None:
             gen_params.extra_args["sound_duration"] = request.sound_duration
 
+        # Tail-regeneration from a previous streaming session.
+        if request.regenerate_from_session_id is not None or request.regenerate_from_frame is not None:
+            if request.regenerate_from_session_id is None or request.regenerate_from_frame is None:
+                raise HTTPException(
+                    status_code=HTTPStatus.BAD_REQUEST.value,
+                    detail="regenerate_from_session_id and regenerate_from_frame must be provided together.",
+                )
+            gen_params.extra_args["regenerate_from_session_id"] = request.regenerate_from_session_id
+            gen_params.extra_args["regenerate_from_frame"] = request.regenerate_from_frame
+
         # Apply model-specific extra parameters
         if request.extra_params is not None:
             if not isinstance(request.extra_params, dict):

@@ -131,6 +131,15 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         # Cache for per-request stepwise state.
         self.state_cache: dict[str, StepRequestState] = {}
 
+        # Model-agnostic store of finished generation sessions, used to
+        # regenerate a video tail from an earlier frame without re-denosing
+        # the prefix.
+        from vllm_omni.diffusion.generation_session import GenerationSessionStore
+
+        self.generation_session_store = GenerationSessionStore(
+            max_entries=getattr(od_config, "generation_session_max_entries", 32),
+        )
+
         # Initialize KV cache manager for connector management.
         self.kv_transfer_manager = OmniKVTransferManager.from_od_config(od_config)
 
@@ -644,12 +653,83 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
 
         return resolved, new_request_ids
 
+    def _save_generation_snapshot(self, state: StepRequestState) -> None:
+        """Persist a finished generation into the session store.
+
+        Called only for successfully-finished streaming requests. The payload
+        is produced by the pipeline's model-specific hook and stored keyed by
+        the request (session) id. Latents are kept on the accelerator device.
+        """
+        try:
+            payload = self.pipeline.snapshot_generation_state(state)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("Failed to snapshot generation state for %s: %s", state.request_id, exc)
+            return
+        if payload is None:
+            return
+        from vllm_omni.diffusion.generation_session import GenerationSessionSnapshot
+
+        sampling = state.sampling
+        extra_args = getattr(sampling, "extra_args", None) or {}
+        # Key snapshots by the externally-visible request id (what the client
+        # echoes back as regenerate_from_session_id) rather than the internal
+        # engine request id, which carries an extra uniqueness suffix.
+        session_id = extra_args.get("external_request_id") or state.request_id
+        self.generation_session_store.put(
+            GenerationSessionSnapshot(
+                session_id=session_id,
+                num_frames=int(getattr(sampling, "num_frames", None) or 0),
+                width=int(getattr(sampling, "width", None) or 0),
+                height=int(getattr(sampling, "height", None) or 0),
+                fps=int(getattr(sampling, "frame_rate", None) or 0),
+                model=self.od_config.model_class_name or "",
+                payload=payload,
+            )
+        )
+        logger.info("Saved generation snapshot for session %s", session_id)
+
+    def _resolve_regeneration(self, state: StepRequestState) -> None:
+        """Resolve a tail-regeneration request into a snapshot seed.
+
+        The user requests regeneration via
+        ``extra_args["regenerate_from_session_id"]`` and
+        ``extra_args["regenerate_from_frame"]``. Both must be provided
+        together; they are forwarded to the pipeline (through ``state.extra``)
+        so the model can seed its latent history from the saved snapshot.
+        """
+        extra_args = getattr(state.sampling, "extra_args", None) or {}
+        regen_sid = extra_args.get("regenerate_from_session_id")
+        regen_frame = extra_args.get("regenerate_from_frame")
+        if regen_sid is None and regen_frame is None:
+            return
+        if regen_sid is None or regen_frame is None:
+            raise ValueError(
+                "regenerate_from_session_id and regenerate_from_frame must be provided together."
+            )
+        snapshot = self.generation_session_store.get(str(regen_sid))
+        if snapshot is None:
+            raise ValueError(
+                f"Unknown or expired regeneration session: {regen_sid!r}. "
+                "The snapshot may have been evicted (LRU) or the session never completed."
+            )
+        state.extra["regenerate_from_snapshot"] = snapshot.payload
+        state.extra["regenerate_from_start_frame"] = int(regen_frame)
+        logger.info(
+            "Regenerating session %s tail from frame %s (start chunk %s)",
+            regen_sid,
+            regen_frame,
+            state.extra["regenerate_from_start_frame"],
+        )
+
     def _prepare_batch_inputs(self, states: list[StepRequestState], new_request_ids: list[str]) -> InputBatch:
         # process new reqs
         for state in states:
             if state.request_id in new_request_ids:
                 self._initialize_generator(state.sampling)
                 clear_pipeline_stage_durations(self.pipeline)
+                # Resolve tail-regeneration request: inject the saved snapshot
+                # into state.extra so prepare_encode() can seed from it.
+                self._resolve_regeneration(state)
                 # encode
                 self.pipeline.prepare_encode(state)
                 merge_stage_durations(
@@ -760,12 +840,33 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                                     )
                             else:
                                 result = None
+                            if req.extra.get("regenerate_from_snapshot") is not None:
+                                logger.info(
+                                    "[REGEN] req=%s chunk=%d/%d step=%d/%d should_decode=%s",
+                                    req.request_id,
+                                    req.chunk_index,
+                                    req.total_chunks,
+                                    req.step_in_chunk,
+                                    req.chunk_num_steps,
+                                    should_decode,
+                                )
                             # finished should be computed after post_decode() advanced chunk_index
                             finished = (
                                 req.request_denoise_completed
                                 if self.od_config.streaming_output
                                 else req.denoise_completed
                             )
+                            # Persist the finished generation as a reusable snapshot
+                            # (used by tail-regeneration requests). Model-agnostic:
+                            # only snapshots if the pipeline exposes the hook.
+                            if (
+                                finished
+                                and self.od_config.streaming_output
+                                and result is not None
+                                and result.error is None
+                                and hasattr(self.pipeline, "snapshot_generation_state")
+                            ):
+                                self._save_generation_snapshot(req)
                             runner_output_list.append(
                                 RunnerOutput(
                                     request_id=req.request_id,

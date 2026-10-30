@@ -13,9 +13,11 @@ Requirements:
 
 import argparse
 import asyncio
+import base64
 import contextlib
 import io
 import json
+import mimetypes
 import os
 import time
 from dataclasses import dataclass
@@ -109,6 +111,13 @@ def _maybe_set(payload: dict[str, Any], key: str, value: Any) -> None:
         payload[key] = value
 
 
+def _video_file_to_data_url(path: str) -> str:
+    """Encode a local video file as a base64 data URL for video_reference."""
+    data = Path(path).read_bytes()
+    mime = mimetypes.guess_type(path)[0] or "video/mp4"
+    return f"data:{mime};base64,{base64.b64encode(data).decode('ascii')}"
+
+
 def build_session_start(args: argparse.Namespace) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "type": "session.start",
@@ -130,6 +139,13 @@ def build_session_start(args: argparse.Namespace) -> dict[str, Any]:
     _maybe_set(payload, "flow_shift", args.flow_shift)
     _maybe_set(payload, "true_cfg_scale", args.true_cfg_scale)
     _maybe_set(payload, "seed", args.seed)
+    _maybe_set(payload, "regenerate_from_session_id", args.regenerate_from_session_id)
+    _maybe_set(payload, "regenerate_from_frame", args.regenerate_from_frame)
+    _maybe_set(payload, "regenerate_prompt_transition_chunks", args.regenerate_prompt_transition_chunks)
+    if args.video_file:
+        payload["video_reference"] = {"video_url": _video_file_to_data_url(args.video_file)}
+    elif args.video_url:
+        payload["video_reference"] = {"video_url": args.video_url}
 
     extra_params: dict[str, Any] = {}
     if "Helios-Distilled" in args.model and args.helios_distilled_preset:
@@ -370,12 +386,66 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--flow-shift", type=float, default=None, help="Scheduler flow_shift for video models")
     parser.add_argument("--true-cfg-scale", type=float, default=None, help="True CFG scale for models that support it")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument(
+        "--regenerate-from-session",
+        dest="regenerate_from_session_id",
+        default=None,
+        help=(
+            "Request id of a previous completed streaming session to continue from. "
+            "Reuses the saved historical latents (avoids re-denosing the prefix). "
+            "Must be combined with --regenerate-from-frame."
+        ),
+    )
+    parser.add_argument(
+        "--regenerate-from-frame",
+        dest="regenerate_from_frame",
+        type=int,
+        default=None,
+        help=(
+            "0-based frame index of the referenced session from which to regenerate "
+            "the tail with a new prompt. Must be combined with --regenerate-from-session."
+        ),
+    )
+    parser.add_argument(
+        "--regenerate-prompt-transition-chunks",
+        dest="regenerate_prompt_transition_chunks",
+        type=int,
+        default=None,
+        help=(
+            "Number of chunks over which the regenerated tail linearly transitions "
+            "from the historical session's prompt to the new prompt (default 3). "
+            "The first regenerated chunk keeps the old prompt. 0 applies the new "
+            "prompt immediately. Only used together with --regenerate-from-session."
+        ),
+    )
 
     parser.add_argument(
         "--helios-distilled-preset",
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Send the Helios-Distilled extra_params used by the bundled example.",
+    )
+    parser.add_argument(
+        "--video-url",
+        dest="video_url",
+        type=str,
+        default=None,
+        help=(
+            "Optional reference video URL (http(s) or data URL) for video-to-video "
+            "generation. The decoded frames are used as the starting history for "
+            "the generated clip."
+        ),
+    )
+    parser.add_argument(
+        "--video-file",
+        dest="video_file",
+        type=str,
+        default=None,
+        help=(
+            "Optional local video file path for video-to-video generation. The file "
+            "is base64-encoded and sent inline as a data URL (mutually exclusive "
+            "with --video-url)."
+        ),
     )
     parser.add_argument(
         "--extra-params",
